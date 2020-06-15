@@ -70,6 +70,7 @@ var (
 const (
 	driverName    = "overlay2"
 	linkDir       = "l"
+	tmpfsDirName  = "tmpfs"
 	diffDirName   = "diff"
 	workDirName   = "work"
 	mergedDirName = "merged"
@@ -518,6 +519,7 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 	}
 
 	mergedDir := path.Join(dir, mergedDirName)
+	tmpfsDir := path.Join(dir, tmpfsDirName)
 	if count := d.ctr.Increment(mergedDir); count > 1 {
 		return containerfs.NewLocalContainerFS(mergedDir), nil
 	}
@@ -530,6 +532,14 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 				// Cleanup the created merged directory; see the comment in Put's rmdir
 				if rmErr := unix.Rmdir(mergedDir); rmErr != nil && !os.IsNotExist(rmErr) {
 					logger.Debugf("Failed to remove %s: %v: %v", id, rmErr, err)
+				}
+				if _, err := os.Stat(tmpfsDir); !os.IsNotExist(err) {
+					if err := unix.Unmount(tmpfsDir, 0); err != nil {
+						logger.Errorf("error unmounting %v: %v", tmpfsDir, err)
+					}
+					if err := unix.Rmdir(tmpfsDir); err != nil {
+						logger.Debugf("Failed to remove %s: %v: %v", id, tmpfsDir, err)
+					}
 				}
 			}
 		}
@@ -563,7 +573,8 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 	if err != nil {
 		return nil, err
 	}
-	if err := idtools.MkdirAndChown(mergedDir, 0700, idtools.Identity{UID: rootUID, GID: rootGID}); err != nil {
+	root := idtools.Identity{UID: rootUID, GID: rootGID}
+	if err := idtools.MkdirAndChown(mergedDir, 0700, root); err != nil {
 		return nil, err
 	}
 
@@ -590,8 +601,60 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		mountTarget = path.Join(id, mergedDirName)
 	}
 
+
+	if !strings.HasSuffix(id, "-init") {
+		if err := idtools.MkdirAndChown(tmpfsDir, 0755, root); err != nil {
+			return nil, err
+		}
+
+		if err := unix.Mount("tmpfs", tmpfsDir, "tmpfs", 0, ""); err != nil {
+			return nil, err
+		}
+
+		tmpfsDiffDir := path.Join(tmpfsDir, diffDirName)
+		if err := idtools.MkdirAndChown(tmpfsDiffDir, 0700, root); err != nil {
+			return nil, err
+		}
+
+		tmpfsWorkDir := path.Join(tmpfsDir, workDirName)
+		if err := idtools.MkdirAndChown(tmpfsWorkDir, 0700, root); err != nil {
+			return nil, err
+		}
+
+		s, err := os.Lstat(diffDir);
+		if err != nil {
+			return nil, err;
+		}
+
+		if s.Mode().IsDir() {
+			if err := unix.Rmdir(diffDir); err != nil {
+				return nil, err
+			}
+
+			if err := os.Symlink(tmpfsDiffDir, diffDir); err != nil {
+				return nil, err
+			}
+		}
+
+
+		s, err = os.Lstat(workDir);
+		if err != nil {
+			return nil, err;
+		}
+
+		if s.Mode().IsDir() {
+			if err := unix.Rmdir(workDir); err != nil {
+				return nil, err
+			}
+
+			if err := os.Symlink(tmpfsWorkDir, workDir); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	if err := mount("overlay", mountTarget, "overlay", 0, mountData); err != nil {
-		return nil, fmt.Errorf("error creating overlay mount to %s: %v", mergedDir, err)
+		return nil, fmt.Errorf("error creating overlay mount to %s: %v, %s", mergedDir, err, mountData)
 	}
 
 	if !readonly {
@@ -637,6 +700,15 @@ func (d *Driver) Put(id string) error {
 	// torvalds/linux@8ed936b5671bfb33d89bc60bdcc7cf0470ba52fe applied.
 	if err := unix.Rmdir(mountpoint); err != nil && !os.IsNotExist(err) {
 		logger.Debugf("Failed to remove %s overlay: %v", id, err)
+	}
+	tmpfsDir := path.Join(dir, tmpfsDirName)
+	if _, err := os.Stat(tmpfsDir); !os.IsNotExist(err) {
+		if err := unix.Unmount(tmpfsDir, 0); err != nil {
+			logger.Errorf("error unmounting %v: %v", tmpfsDir, err)
+		}
+		if err := unix.Rmdir(tmpfsDir); err != nil {
+			logger.Debugf("Failed to remove %s: %v: %v", id, tmpfsDir, err)
+		}
 	}
 	return nil
 }
